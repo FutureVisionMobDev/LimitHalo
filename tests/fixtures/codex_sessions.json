@@ -22,7 +22,7 @@
   ],
   "rejected": [
     {
-      "name": "account-read-is-not-a-rate-limit-response",
+      "name": "account-projection-cannot-substitute-for-rate-limits",
       "incoming": [
         {"id": 1, "result": {}},
         {"id": 2, "result": {"account": null, "requiresOpenaiAuth": false}}
