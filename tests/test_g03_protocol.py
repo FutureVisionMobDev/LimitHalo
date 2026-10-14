@@ -44,14 +44,12 @@ from limit_halo.codex_discovery import (
     verify_candidate_unchanged,
 )
 from limit_halo.codex_protocol import (
-    AuthorizationRequired,
     CodexCollector,
     CodexSession,
     MAX_JSON_NESTING,
     ProtocolFailure,
     SubprocessTransport,
     _load_object,
-    account_is_usable,
     app_server_command,
     normalize_rate_limits,
 )
@@ -100,16 +98,6 @@ def valid_trust() -> TrustRecord:
 
 
 class G03ProtocolTests(unittest.TestCase):
-    @staticmethod
-    def account_frame(request_id: int = 2, *, present: bool = False, required: bool = False) -> dict[str, Any]:
-        return {
-            "id": request_id,
-            "result": {
-                "account": {"type": "chatgpt"} if present else None,
-                "requiresOpenaiAuth": required,
-            },
-        }
-
     def test_frozen_codex_fixture_corpus(self) -> None:
         corpus = json.loads((FIXTURES / "codex_frames.json").read_text(encoding="utf-8"))
         now = corpus["observedAt"]
@@ -122,6 +110,23 @@ class G03ProtocolTests(unittest.TestCase):
                 with self.assertRaises(ProtocolFailure):
                     normalize_rate_limits(case["result"], observed_at=now)
 
+    def test_frozen_codex_session_sequence_fixtures(self) -> None:
+        corpus = json.loads((FIXTURES / "codex_sessions.json").read_text(encoding="utf-8"))
+        for case in corpus["accepted"]:
+            with self.subTest(case=case["name"]):
+                transport = FakeTransport(case["incoming"])
+                with mock.patch("limit_halo.codex_protocol.time.time", return_value=corpus["observedAt"]):
+                    metrics = CodexSession(transport).initialize_and_read()
+                self.assertEqual([message["method"] for message in transport.sent], case["methods"])
+                self.assertEqual([metric.window_duration_mins for metric in metrics], case["durations"])
+        for case in corpus["rejected"]:
+            with self.subTest(case=case["name"]):
+                transport = FakeTransport(case["incoming"])
+                with mock.patch("limit_halo.codex_protocol.time.time", return_value=corpus["observedAt"]):
+                    with self.assertRaises(ProtocolFailure):
+                        CodexSession(transport).initialize_and_read()
+                self.assertNotIn("account/read", [message.get("method") for message in transport.sent])
+
     def test_codex_protocol_is_one_in_session_handshake_without_probe(self) -> None:
         now = int(time.time())
         result = {
@@ -131,50 +136,28 @@ class G03ProtocolTests(unittest.TestCase):
                 "secondary": {"windowDurationMins": 10_080, "usedPercent": 50, "resetsAt": now + 500_000},
             }
         }
-        transport = FakeTransport([{"id": 1, "result": {}}, self.account_frame(), {"id": 3, "result": result}])
+        transport = FakeTransport([{"id": 1, "result": {}}, {"id": 2, "result": result}])
         metrics = CodexSession(transport).initialize_and_read()
         self.assertEqual([message["method"] for message in transport.sent], [
-            "initialize", "initialized", "account/read", "account/rateLimits/read"
+            "initialize", "initialized", "account/rateLimits/read"
         ])
-        self.assertEqual(transport.sent[2]["params"], {"refreshToken": False})
+        self.assertIsNone(transport.sent[2]["params"])
         self.assertEqual(len(metrics), 2)
         self.assertFalse(any(message["method"].startswith(("thread/", "turn/")) for message in transport.sent))
         bad = FakeTransport([{"method": "thread/started", "params": {}}, {"id": 1, "result": {}}])
         with self.assertRaises(ProtocolFailure):
             CodexSession(bad).initialize_and_read()
-
-    def test_exact_account_read_classification_without_retaining_account_data(self) -> None:
-        self.assertFalse(account_is_usable({"account": None, "requiresOpenaiAuth": True}))
-        self.assertTrue(account_is_usable({"account": None, "requiresOpenaiAuth": False}))
-        self.assertTrue(account_is_usable({"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True}))
-        self.assertTrue(account_is_usable({
-            "account": {"type": "chatgpt", "ignored": "metadata"},
-            "requiresOpenaiAuth": False,
-            "email": "ignored@example.invalid",
-        }))
-        for malformed in (
-            {"account": None},
-            {"account": None, "requiresOpenaiAuth": 1},
-            {"account": "identifier", "requiresOpenaiAuth": False},
-        ):
-            with self.assertRaises(ProtocolFailure):
-                account_is_usable(malformed)
-        session = CodexSession(FakeTransport([{"id": 1, "result": {}}, self.account_frame(required=True)]))
-        with self.assertRaises(AuthorizationRequired):
-            session.initialize_and_read()
-        store = mock.Mock()
-        candidate = CodexCandidate("npm", Version.parse("1.0.0"), Path("codex.exe"), Path("."))
-        collector = CodexCollector(
-            store,
-            discovery=lambda: candidate,
-            transport_factory=lambda _candidate: FakeTransport([
-                {"id": 1, "result": {}}, self.account_frame(required=True)
-            ]),
-        )
-        store.mark_provider.side_effect = lambda *_args, **_kwargs: collector.request_stop()
-        collector._run()
-        store.mark_provider.assert_called_once_with(
-            "codex", ProviderState.AUTHORIZATION_REQUIRED, error_code="authorization_required"
+        # account/read is outside the documented method boundary; its shape
+        # cannot be mistaken for a valid rate-limit snapshot.
+        account_read = FakeTransport([
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"account": None, "requiresOpenaiAuth": False}},
+        ])
+        with self.assertRaises(ProtocolFailure):
+            CodexSession(account_read).initialize_and_read()
+        self.assertEqual(
+            [message["method"] for message in account_read.sent],
+            ["initialize", "initialized", "account/rateLimits/read"],
         )
 
     def test_only_exact_full_rate_limit_update_is_accepted_in_every_phase(self) -> None:
@@ -187,12 +170,12 @@ class G03ProtocolTests(unittest.TestCase):
         update = {"method": "account/rateLimits/updated", "params": {"rateLimits": snapshot}}
         result = {"rateLimits": snapshot}
 
-        initialize_phase = FakeTransport([update, {"id": 1, "result": {}}, self.account_frame(), {"id": 3, "result": result}])
+        initialize_phase = FakeTransport([update, {"id": 1, "result": {}}, {"id": 2, "result": result}])
         session = CodexSession(initialize_phase)
         self.assertEqual(len(session.initialize_and_read()), 2)
         self.assertTrue(session.wait_for_update(0))
 
-        read_phase = FakeTransport([{"id": 1, "result": {}}, self.account_frame(), update, {"id": 3, "result": result}])
+        read_phase = FakeTransport([{"id": 1, "result": {}}, update, {"id": 2, "result": result}])
         self.assertEqual(len(CodexSession(read_phase).initialize_and_read()), 2)
 
         steady = CodexSession(FakeTransport([update]))
@@ -212,10 +195,10 @@ class G03ProtocolTests(unittest.TestCase):
             for message in malformed:
                 with self.subTest(phase=phase, message=message):
                     if phase == "initialize":
-                        incoming = [message, {"id": 1, "result": {}}, self.account_frame(), {"id": 3, "result": result}]
+                        incoming = [message, {"id": 1, "result": {}}, {"id": 2, "result": result}]
                         action = lambda incoming=incoming: CodexSession(FakeTransport(incoming)).initialize_and_read()
                     elif phase == "read":
-                        incoming = [{"id": 1, "result": {}}, self.account_frame(), message, {"id": 3, "result": result}]
+                        incoming = [{"id": 1, "result": {}}, message, {"id": 2, "result": result}]
                         action = lambda incoming=incoming: CodexSession(FakeTransport(incoming)).initialize_and_read()
                     else:
                         action = lambda message=message: CodexSession(FakeTransport([message])).wait_for_update(0.1)
@@ -256,16 +239,8 @@ class G03ProtocolTests(unittest.TestCase):
             remote_status,
             {"id": 1, "result": {}},
             remote_status,
-            {
-                "id": 2,
-                "result": {
-                    "account": {"type": "chatgpt", "ignored": "metadata"},
-                    "requiresOpenaiAuth": False,
-                    "email": "ignored@example.invalid",
-                },
-            },
             remote_status,
-            {"id": 3, "result": result},
+            {"id": 2, "result": result},
         ])
         metrics = CodexSession(transport).initialize_and_read()
         self.assertEqual(
@@ -338,15 +313,13 @@ class G03ProtocolTests(unittest.TestCase):
                 return
 
         valid_initialize = b'{"id":1,"result":{}}'
-        valid_account = b'{"id":2,"result":{"account":null,"requiresOpenaiAuth":false}}'
         valid_snapshot = (
-            b'{"id":3,"result":{"rateLimits":{"limitId":"codex",'
+            b'{"id":2,"result":{"rateLimits":{"limitId":"codex",'
             b'"primary":{"windowDurationMins":300,"usedPercent":25,"resetsAt":2000010000}}}}'
         )
         for name, frames, action in (
             ("initialize", [oversized], lambda session: session.initialize_and_read()),
-            ("account", [valid_initialize, oversized], lambda session: session.initialize_and_read()),
-            ("read", [valid_initialize, valid_account, oversized], lambda session: session.initialize_and_read()),
+            ("read", [valid_initialize, oversized], lambda session: session.initialize_and_read()),
             ("steady", [oversized], lambda session: session.wait_for_update(0.1)),
         ):
             with self.subTest(phase=name):
@@ -375,13 +348,13 @@ class G03ProtocolTests(unittest.TestCase):
                     normalize_rate_limits(result(used), observed_at=now)
         self.assertEqual(normalize_rate_limits(result(100.0), observed_at=now)[0].used_percent, 100)
 
-        transport = FakeTransport([{"id": 1, "result": {}}, self.account_frame(), {"id": 3, "result": result(10**10_000)}])
+        transport = FakeTransport([{"id": 1, "result": {}}, {"id": 2, "result": result(10**10_000)}])
         with self.assertRaises(ProtocolFailure):
             CodexSession(transport).initialize_and_read()
 
         store = mock.Mock()
         candidate = CodexCandidate("npm", Version.parse("1.0.0"), Path("codex.exe"), Path("."))
-        collector_transport = FakeTransport([{"id": 1, "result": {}}, self.account_frame(), {"id": 3, "result": result(10**10_000)}])
+        collector_transport = FakeTransport([{"id": 1, "result": {}}, {"id": 2, "result": result(10**10_000)}])
         collector = CodexCollector(
             store,
             discovery=lambda: candidate,

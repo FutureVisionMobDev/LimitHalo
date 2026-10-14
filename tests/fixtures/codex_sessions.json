@@ -1,0 +1,38 @@
+{
+  "observedAt": 2000000000,
+  "accepted": [
+    {
+      "name": "initialize-initialized-rate-limits-read",
+      "incoming": [
+        {"id": 1, "result": {}},
+        {
+          "id": 2,
+          "result": {
+            "rateLimits": {
+              "limitId": "codex",
+              "primary": {"windowDurationMins": 300, "usedPercent": 25, "resetsAt": 2000010000},
+              "secondary": {"windowDurationMins": 10080, "usedPercent": 50, "resetsAt": 2000600000}
+            }
+          }
+        }
+      ],
+      "methods": ["initialize", "initialized", "account/rateLimits/read"],
+      "durations": [300, 10080]
+    }
+  ],
+  "rejected": [
+    {
+      "name": "account-read-is-not-a-rate-limit-response",
+      "incoming": [
+        {"id": 1, "result": {}},
+        {"id": 2, "result": {"account": null, "requiresOpenaiAuth": false}}
+      ]
+    },
+    {
+      "name": "server-request-during-initialization",
+      "incoming": [
+        {"id": 1, "method": "server/request", "params": {}}
+      ]
+    }
+  ]
+}

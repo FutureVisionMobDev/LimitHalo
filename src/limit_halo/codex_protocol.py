@@ -45,29 +45,11 @@ DISABLED_FEATURES = (
     "tool_call_mcp_elicitation",
     "workspace_dependencies",
 )
-ALLOWED_METHODS = frozenset({"initialize", "initialized", "account/read", "account/rateLimits/read"})
+ALLOWED_METHODS = frozenset({"initialize", "initialized", "account/rateLimits/read"})
 
 
 class ProtocolFailure(RuntimeError):
     pass
-
-
-class AuthorizationRequired(ProtocolFailure):
-    """The official app server explicitly reported missing required auth."""
-
-
-def account_is_usable(result: Any) -> bool:
-    """Classify only the two documented account/read fields; retain no account data."""
-
-    if not isinstance(result, dict) or not {"account", "requiresOpenaiAuth"}.issubset(result):
-        raise ProtocolFailure("account/read schema mismatch")
-    requires_auth = result["requiresOpenaiAuth"]
-    account = result["account"]
-    if not isinstance(requires_auth, bool):
-        raise ProtocolFailure("account/read requiresOpenaiAuth is not boolean")
-    if account is not None and not isinstance(account, dict):
-        raise ProtocolFailure("account/read account shape rejected")
-    return not (account is None and requires_auth)
 
 
 class Transport(Protocol):
@@ -344,7 +326,7 @@ class CodexSession:
         return "update"
 
     def _request(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
-        if method not in {"initialize", "account/read", "account/rateLimits/read"}:
+        if method not in {"initialize", "account/rateLimits/read"}:
             raise ProtocolFailure("request outside fixed protocol")
         request_id = self._next_id
         self._next_id += 1
@@ -374,8 +356,6 @@ class CodexSession:
             },
         )
         self.transport.send({"method": "initialized", "params": {}})
-        if not account_is_usable(self._request("account/read", {"refreshToken": False})):
-            raise AuthorizationRequired("Codex authorization required")
         return self.read()
 
     def read(self) -> tuple[Metric, ...]:
@@ -485,10 +465,6 @@ class CodexCollector:
                         self._accept_snapshot(session.read())
                         if now >= next_poll:
                             next_poll = now + CODEX_POLL_SECONDS
-            except AuthorizationRequired:
-                self.store.mark_provider(
-                    "codex", ProviderState.AUTHORIZATION_REQUIRED, error_code="authorization_required"
-                )
             except (OSError, DiscoveryFailure, ProtocolFailure):
                 self.store.mark_provider("codex", ProviderState.PROVIDER_ERROR, error_code="codex_unavailable")
             finally:
